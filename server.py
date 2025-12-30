@@ -1,26 +1,25 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException, UploadFile, File, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from pymongo import MongoClient
 from datetime import datetime, timedelta
+import os
+from dotenv import load_dotenv
+from PIL import Image
+import requests
+import uuid
+import base64
+from io import BytesIO
+from typing import Optional
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
-import requests
-import os
-import base64
-import io
-from PIL import Image
-import uuid
-import json
-import secrets
-from typing import Optional
-from dotenv import load_dotenv
 
+# Load environment variables
 load_dotenv()
 
+# Initialize FastAPI app
 app = FastAPI(title="Face Wellness Tracker API")
 
-# CORS middleware
+# Configure CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -30,72 +29,85 @@ app.add_middleware(
 )
 
 # MongoDB connection
-client = MongoClient(os.getenv("MONGO_URL"))
-db = client[os.getenv("DB_NAME")]
-users_collection = db.users
-sessions_collection = db.sessions
-analysis_collection = db.facial_analysis
-habits_collection = db.habits
+MONGO_URL = os.getenv("MONGO_URL")
+DB_NAME = os.getenv("DB_NAME")
+client = MongoClient(MONGO_URL)
+db = client[DB_NAME]
 
-# API Configuration
+# Collections
+users_collection = db["users"]
+sessions_collection = db["sessions"]
+facial_analysis_collection = db["facial_analysis"]
+habits_collection = db["habits"]
+
+# External API configuration
 AILAB_API_KEY = os.getenv("AILAB_API_KEY")
 AILAB_API_URL = "https://www.ailabapi.com/api/portrait/analysis/skin-analysis-advanced"
+
+# Google OAuth configuration
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 
-# Helper function to verify session
-async def verify_session(session_token: str = Header(None)):
+# Session verification helper
+async def verify_session(session_token: Optional[str] = Header(None)):
     if not session_token:
-        raise HTTPException(status_code=401, detail="Session token required")
+        raise HTTPException(status_code=401, detail="No session token provided")
     
     session = sessions_collection.find_one({"session_token": session_token})
     if not session:
-        raise HTTPException(status_code=401, detail="Invalid session")
+        raise HTTPException(status_code=401, detail="Invalid session token")
     
-    # Check if session is expired
+    # Check if session is expired (7 days)
     if datetime.utcnow() > session["expires_at"]:
         sessions_collection.delete_one({"session_token": session_token})
         raise HTTPException(status_code=401, detail="Session expired")
     
     return session["user_id"]
 
+# Health check endpoint
 @app.get("/api/health")
 async def health_check():
-    return {"status": "healthy", "timestamp": datetime.utcnow()}
+    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
 
+# Google OAuth authentication endpoint
 @app.post("/api/auth/google")
 async def google_auth(request: dict):
-    """Handle Google OAuth authentication"""
+    """
+    Authenticate user with Google OAuth token
+    Expected request body: {"credential": "google_jwt_token"}
+    """
     try:
-        token = request.get("credential")
-        if not token:
-            raise HTTPException(status_code=400, detail="Google credential required")
+        # Get the credential from request
+        credential = request.get("credential")
+        if not credential:
+            raise HTTPException(status_code=400, detail="No credential provided")
         
-        # Verify Google token
+        # Verify the Google token
         try:
             idinfo = id_token.verify_oauth2_token(
-                token, 
+                credential, 
                 google_requests.Request(), 
                 GOOGLE_CLIENT_ID
             )
-            
-            if idinfo['iss'] not in ['accounts.google.com', 'https://accounts.google.com']:
-                raise ValueError('Wrong issuer.')
-                
         except ValueError as e:
             raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
         
-        # Extract user info
-        email = idinfo['email']
-        name = idinfo.get('name', '')
-        picture = idinfo.get('picture', '')
+        # Extract user information from the token
+        email = idinfo.get("email")
+        name = idinfo.get("name")
+        picture = idinfo.get("picture")
+        
+        if not email:
+            raise HTTPException(status_code=400, detail="Email not found in token")
         
         # Check if user exists
         existing_user = users_collection.find_one({"email": email})
         
-        if not existing_user:
+        if existing_user:
+            user_id = existing_user["user_id"]
+        else:
             # Create new user
             user_id = str(uuid.uuid4())
-            user_doc = {
+            new_user = {
                 "user_id": user_id,
                 "email": email,
                 "name": name,
@@ -103,81 +115,86 @@ async def google_auth(request: dict):
                 "created_at": datetime.utcnow(),
                 "total_photos": 0,
                 "current_streak": 0,
-                "longest_streak": 0,
-                "last_photo_date": None
+                "longest_streak": 0
             }
-            users_collection.insert_one(user_doc)
-        else:
-            user_id = existing_user["user_id"]
-            name = existing_user["name"]
-            picture = existing_user["picture"]
+            users_collection.insert_one(new_user)
         
-        # Create session
-        session_token = secrets.token_urlsafe(32)
-        session_doc = {
+        # Create session token
+        session_token = str(uuid.uuid4())
+        session_data = {
             "session_token": session_token,
             "user_id": user_id,
             "created_at": datetime.utcnow(),
-            "expires_at": datetime.utcnow() + timedelta(days=30)
+            "expires_at": datetime.utcnow() + timedelta(days=7)
         }
-        sessions_collection.insert_one(session_doc)
+        sessions_collection.insert_one(session_data)
         
-        # Get user stats
+        # Get user data
         user = users_collection.find_one({"user_id": user_id})
+        user.pop("_id", None)
         
         return {
             "session_token": session_token,
-            "user": {
-                "user_id": user_id,
-                "email": email,
-                "name": name,
-                "picture": picture,
-                "total_photos": user["total_photos"],
-                "current_streak": user["current_streak"],
-                "longest_streak": user["longest_streak"]
-            }
+            "user": user
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Auth error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Authentication failed: {str(e)}")
 
+# Get user profile
 @app.get("/api/user/profile")
 async def get_user_profile(user_id: str = Depends(verify_session)):
-    """Get user profile and stats"""
+    """Get user profile with recent analysis data"""
     user = users_collection.find_one({"user_id": user_id})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     
-    # Get recent analysis
-    recent_analysis = list(analysis_collection.find(
-        {"user_id": user_id}
+    user.pop("_id", None)
+    
+    # Get recent analyses (last 7 days)
+    seven_days_ago = datetime.utcnow() - timedelta(days=7)
+    recent_analyses = list(facial_analysis_collection.find(
+        {"user_id": user_id, "timestamp": {"$gte": seven_days_ago}}
     ).sort("timestamp", -1).limit(7))
     
-    # Calculate streak
-    today = datetime.utcnow().date()
-    streak = 0
-    for analysis in recent_analysis:
-        analysis_date = analysis["timestamp"].date()
-        days_diff = (today - analysis_date).days
-        if days_diff == streak:
-            streak += 1
-        else:
-            break
+    # Remove MongoDB _id and image data
+    for analysis in recent_analyses:
+        analysis.pop("_id", None)
+        analysis.pop("image_base64", None)
+    
+    # Calculate current streak
+    all_analyses = list(facial_analysis_collection.find(
+        {"user_id": user_id}
+    ).sort("timestamp", -1))
+    
+    current_streak = 0
+    if all_analyses:
+        last_date = all_analyses[0]["timestamp"].date()
+        today = datetime.utcnow().date()
+        
+        if last_date == today:
+            current_streak = 1
+            for i in range(1, len(all_analyses)):
+                expected_date = last_date - timedelta(days=i)
+                if all_analyses[i]["timestamp"].date() == expected_date:
+                    current_streak += 1
+                else:
+                    break
+    
+    user["current_streak"] = current_streak
+    users_collection.update_one(
+        {"user_id": user_id},
+        {"$set": {"current_streak": current_streak}}
+    )
     
     return {
-        "user": {
-            "user_id": user["user_id"],
-            "email": user["email"],
-            "name": user["name"],
-            "picture": user.get("picture", ""),
-            "total_photos": user.get("total_photos", 0),
-            "current_streak": streak,
-            "longest_streak": user.get("longest_streak", 0)
-        },
-        "recent_analysis": recent_analysis
+        "user": user,
+        "recent_analyses": recent_analyses
     }
 
+# Analyze face endpoint
 @app.post("/api/analyze-face")
 async def analyze_face(
     image: UploadFile = File(...),
@@ -185,73 +202,78 @@ async def analyze_face(
 ):
     """Analyze uploaded face image"""
     try:
-        # Check if image was uploaded today
-        today = datetime.utcnow().date()
-        existing_today = analysis_collection.find_one({
+        # Check if user already uploaded a photo today
+        today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        today_end = today_start + timedelta(days=1)
+        
+        existing_analysis = facial_analysis_collection.find_one({
             "user_id": user_id,
-            "timestamp": {
-                "$gte": datetime.combine(today, datetime.min.time()),
-                "$lt": datetime.combine(today + timedelta(days=1), datetime.min.time())
-            }
+            "timestamp": {"$gte": today_start, "$lt": today_end}
         })
         
-        if existing_today:
-            raise HTTPException(status_code=400, detail="Photo already uploaded today")
+        if existing_analysis:
+            raise HTTPException(
+                status_code=400,
+                detail="You've already uploaded a photo today. Come back tomorrow!"
+            )
         
-        # Validate image
-        if not image.content_type.startswith('image/'):
-            raise HTTPException(status_code=400, detail="File must be an image")
+        # Validate image type
+        if image.content_type not in ["image/jpeg", "image/jpg", "image/png"]:
+            raise HTTPException(status_code=400, detail="Invalid image type. Please upload JPG or PNG.")
         
         # Read and process image
-        contents = await image.read()
+        image_data = await image.read()
+        img = Image.open(BytesIO(image_data))
+        
+        # Convert to RGB if needed
+        if img.mode != "RGB":
+            img = img.convert("RGB")
         
         # Convert to base64 for storage
-        image_base64 = base64.b64encode(contents).decode('utf-8')
+        buffered = BytesIO()
+        img.save(buffered, format="JPEG")
+        image_base64 = base64.b64encode(buffered.getvalue()).decode()
         
-        # Prepare request to AILabTools API
-        files = {"image": (image.filename, contents, image.content_type)}
-        headers = {"ailabapi-api-key": AILAB_API_KEY}
+        # Call AILab API
+        ailab_payload = {
+            "image": image_base64,
+            "ai_tool": "skin_analysis_advanced"
+        }
         
-        # Call AILabTools API
-        response = requests.post(AILAB_API_URL, files=files, headers=headers)
+        headers = {
+            "ailabapi-api-key": AILAB_API_KEY,
+            "Content-Type": "application/json"
+        }
+        
+        response = requests.post(AILAB_API_URL, json=ailab_payload, headers=headers)
         
         if response.status_code != 200:
-            raise HTTPException(status_code=500, detail="Facial analysis failed")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Face analysis failed: {response.text}"
+            )
         
-        api_result = response.json()
+        ailab_result = response.json()
         
-        if api_result.get("error_code") != 0:
-            raise HTTPException(status_code=400, detail=api_result.get("error_msg", "API error"))
+        # Extract relevant data
+        result_data = ailab_result.get("data", {})
         
-        # Extract analysis results
-        result = api_result.get("result", {})
-        
+        # Store analysis in database
+        analysis_id = str(uuid.uuid4())
         analysis_data = {
-            "analysis_id": str(uuid.uuid4()),
+            "analysis_id": analysis_id,
             "user_id": user_id,
             "timestamp": datetime.utcnow(),
             "image_base64": image_base64,
             "results": {
-                "eye_pouch": {
-                    "value": result.get("eye_pouch", {}).get("value", 0),
-                    "confidence": result.get("eye_pouch", {}).get("confidence", 0)
-                },
-                "dark_circle": {
-                    "value": result.get("dark_circle", {}).get("value", 0),
-                    "confidence": result.get("dark_circle", {}).get("confidence", 0)
-                },
-                "skin_age": {
-                    "value": result.get("skin_age", {}).get("value", 25)
-                },
-                "forehead_wrinkle": {
-                    "value": result.get("forehead_wrinkle", {}).get("value", 0),
-                    "confidence": result.get("forehead_wrinkle", {}).get("confidence", 0)
-                }
+                "eye_pouch": result_data.get("eye_pouch", {}),
+                "dark_circle": result_data.get("dark_circle", {}),
+                "skin_age": result_data.get("skin_age", {}),
+                "forehead_wrinkle": result_data.get("forehead_wrinkle", {})
             }
         }
         
-        # Save analysis
-        analysis_collection.insert_one(analysis_data)
+        facial_analysis_collection.insert_one(analysis_data)
         
         # Update user stats
         users_collection.update_one(
@@ -259,19 +281,21 @@ async def analyze_face(
             {"$inc": {"total_photos": 1}}
         )
         
+        # Return analysis results
         return {
-            "analysis_id": analysis_data["analysis_id"],
-            "timestamp": analysis_data["timestamp"],
+            "analysis_id": analysis_id,
+            "timestamp": analysis_data["timestamp"].isoformat(),
             "results": analysis_data["results"]
         }
         
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
 
+# Log habits endpoint
 @app.post("/api/habits/log")
-async def log_daily_habits(
+async def log_habits(
     habits_data: dict,
     user_id: str = Depends(verify_session)
 ):
@@ -279,109 +303,106 @@ async def log_daily_habits(
     try:
         today = datetime.utcnow().date()
         
-        # Check if habits already logged today
-        existing_habits = habits_collection.find_one({
-            "user_id": user_id,
-            "date": today
-        })
-        
-        if existing_habits:
-            # Update existing habits
-            habits_collection.update_one(
-                {"user_id": user_id, "date": today},
-                {"$set": {
-                    "habits": habits_data,
-                    "updated_at": datetime.utcnow()
-                }}
-            )
-        else:
-            # Create new habits entry
-            habits_doc = {
+        # Update or create habit log for today
+        habits_collection.update_one(
+            {"user_id": user_id, "date": today.isoformat()},
+            {"$set": {
                 "user_id": user_id,
-                "date": today,
+                "date": today.isoformat(),
                 "habits": habits_data,
-                "created_at": datetime.utcnow()
-            }
-            habits_collection.insert_one(habits_doc)
+                "updated_at": datetime.utcnow()
+            }},
+            upsert=True
+        )
         
         return {"message": "Habits logged successfully"}
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Failed to log habits: {str(e)}")
 
+# Get analysis history
 @app.get("/api/analysis/history")
 async def get_analysis_history(
-    limit: int = 30,
-    user_id: str = Depends(verify_session)
+    user_id: str = Depends(verify_session),
+    limit: int = 30
 ):
     """Get user's analysis history"""
     try:
-        history = list(analysis_collection.find(
-            {"user_id": user_id},
-            {"image_base64": 0}  # Exclude image data for performance
+        analyses = list(facial_analysis_collection.find(
+            {"user_id": user_id}
         ).sort("timestamp", -1).limit(limit))
         
-        return {"history": history}
+        # Remove MongoDB _id and image data for performance
+        for analysis in analyses:
+            analysis.pop("_id", None)
+            analysis.pop("image_base64", None)
+        
+        return {"history": analyses}
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Failed to get history: {str(e)}")
 
+# Get insights
 @app.get("/api/insights")
 async def get_insights(user_id: str = Depends(verify_session)):
-    """Generate insights from user's data"""
+    """Get personalized insights based on analysis history"""
     try:
-        # Get recent analysis (last 7 days)
-        recent_analysis = list(analysis_collection.find(
+        # Get last 7 analyses
+        analyses = list(facial_analysis_collection.find(
             {"user_id": user_id}
         ).sort("timestamp", -1).limit(7))
         
-        if not recent_analysis:
-            return {"message": "No data available for insights"}
+        if not analyses:
+            return {
+                "message": "No analysis data available yet",
+                "insights": []
+            }
         
         # Calculate averages
-        avg_eye_pouch = sum(a["results"]["eye_pouch"]["value"] for a in recent_analysis) / len(recent_analysis)
-        avg_dark_circle = sum(a["results"]["dark_circle"]["value"] for a in recent_analysis) / len(recent_analysis)
-        avg_skin_age = sum(a["results"]["skin_age"]["value"] for a in recent_analysis) / len(recent_analysis)
+        avg_eye_pouch = sum(a["results"]["eye_pouch"].get("confidence", 0) for a in analyses) / len(analyses)
+        avg_dark_circle = sum(a["results"]["dark_circle"].get("confidence", 0) for a in analyses) / len(analyses)
+        avg_skin_age = sum(float(a["results"]["skin_age"].get("age", 0)) for a in analyses) / len(analyses)
         
-        # Generate insights
         insights = []
         
-        if avg_eye_pouch > 1.5:
+        # Generate insights
+        if avg_eye_pouch > 0.6:
             insights.append({
                 "type": "warning",
-                "message": "Your eye puffiness levels are elevated. Consider getting more sleep and reducing screen time."
+                "message": "Your eye pouch levels are elevated. Consider getting more sleep and staying hydrated."
             })
         
-        if avg_dark_circle > 1.5:
+        if avg_dark_circle > 0.6:
             insights.append({
-                "type": "warning", 
-                "message": "Dark circles are prominent. Stay hydrated and maintain a consistent sleep schedule."
+                "type": "warning",
+                "message": "Dark circles detected. Try using a vitamin C serum and ensure adequate rest."
             })
         
         if avg_skin_age > 30:
             insights.append({
                 "type": "info",
-                "message": "Consider a skincare routine with moisturizer and sunscreen for healthier skin."
+                "message": f"Your estimated skin age is {int(avg_skin_age)}. Maintain a good skincare routine to keep it healthy."
             })
         
         if not insights:
             insights.append({
                 "type": "success",
-                "message": "Great job! Your facial wellness indicators are looking good. Keep up the healthy habits!"
+                "message": "Great job! Your skin metrics look healthy. Keep up the good work!"
             })
         
         return {
-            "insights": insights,
             "averages": {
                 "eye_pouch": round(avg_eye_pouch, 2),
                 "dark_circle": round(avg_dark_circle, 2),
                 "skin_age": round(avg_skin_age, 1)
-            }
+            },
+            "insights": insights
         }
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Failed to get insights: {str(e)}")
 
+# Run the app
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8001)
