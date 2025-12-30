@@ -28,3 +28,5 @@ pydantic-settings==2.7.1
 
 # Auth (optional - if needed)
 PyJWT==2.10.1
+# Add Google Authentication
+google-auth==2.36.0
