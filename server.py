@@ -12,6 +12,9 @@ import uuid
 import json
 from typing import Optional
 from dotenv import load_dotenv
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
+import secrets
 
 load_dotenv()
 
@@ -37,7 +40,7 @@ habits_collection = db.habits
 # API Configuration
 AILAB_API_KEY = os.getenv("AILAB_API_KEY")
 AILAB_API_URL = "https://www.ailabapi.com/api/portrait/analysis/skin-analysis-advanced"
-
+GOOGLE_CLIENT_ID = os.getenv("299589499850-k8bihp6jic80pb1neeq6f0e2kt1o4l09.apps.googleusercontent.com")
 # Helper function to verify session
 async def verify_session(session_token: str = Header(None)):
     if not session_token:
@@ -55,56 +58,85 @@ async def verify_session(session_token: str = Header(None)):
     return session["user_id"]
 
 @app.get("/api/health")
-async def health_check():
-    return {"status": "healthy", "timestamp": datetime.utcnow()}
-
-@app.post("/api/auth/profile")
-async def handle_auth_profile(request: dict):
-    """Handle authentication from Emergent auth system"""
+@app.post("/api/auth/google")
+async def google_auth(request: dict):
+    """Handle Google OAuth authentication"""
     try:
-        session_id = request.get("session_id")
-        if not session_id:
-            raise HTTPException(status_code=400, detail="Session ID required")
+        token = request.get("credential")
+        if not token:
+            raise HTTPException(status_code=400, detail="Google credential required")
         
-        # Call Emergent auth API
-        headers = {"X-Session-ID": session_id}
-        response = requests.get(
-            "https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data",
-            headers=headers
-        )
+        # Verify Google token
+        try:
+            idinfo = id_token.verify_oauth2_token(
+                token, 
+                google_requests.Request(), 
+                GOOGLE_CLIENT_ID
+            )
+            
+            if idinfo['iss'] not in ['accounts.google.com', 'https://accounts.google.com']:
+                raise ValueError('Wrong issuer.')
+                
+        except ValueError as e:
+            raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
         
-        if response.status_code != 200:
-            raise HTTPException(status_code=400, detail="Invalid session")
-        
-        user_data = response.json()
+        # Extract user info
+        email = idinfo['email']
+        name = idinfo.get('name', '')
+        picture = idinfo.get('picture', '')
         
         # Check if user exists
-        existing_user = users_collection.find_one({"email": user_data["email"]})
+        existing_user = users_collection.find_one({"email": email})
         
         if not existing_user:
             # Create new user
             user_id = str(uuid.uuid4())
             user_doc = {
                 "user_id": user_id,
-                "email": user_data["email"],
-                "name": user_data["name"],
-                "picture": user_data.get("picture", ""),
+                "email": email,
+                "name": name,
+                "picture": picture,
                 "created_at": datetime.utcnow(),
                 "total_photos": 0,
                 "current_streak": 0,
-                "longest_streak": 0
+                "longest_streak": 0,
+                "last_photo_date": None
             }
             users_collection.insert_one(user_doc)
         else:
             user_id = existing_user["user_id"]
+            name = existing_user["name"]
+            picture = existing_user["picture"]
         
         # Create session
-        session_token = user_data["session_token"]
+        session_token = secrets.token_urlsafe(32)
         session_doc = {
             "session_token": session_token,
             "user_id": user_id,
             "created_at": datetime.utcnow(),
-            "expires_at": datetime.utcnow() + timedelta(days=7)
+            "expires_at": datetime.utcnow() + timedelta(days=30)
+        }
+        sessions_collection.insert_one(session_doc)
+        
+        # Get user stats
+        user = users_collection.find_one({"user_id": user_id})
+        
+        return {
+            "session_token": session_token,
+            "user": {
+                "user_id": user_id,
+                "email": email,
+                "name": name,
+                "picture": picture,
+                "total_photos": user["total_photos"],
+                "current_streak": user["current_streak"],
+                "longest_streak": user["longest_streak"]
+            }
+        }
+        
+    except Exception as e:
+        print(f"Auth error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
         }
         sessions_collection.insert_one(session_doc)
         
