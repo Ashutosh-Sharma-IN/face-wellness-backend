@@ -3,6 +3,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pymongo import MongoClient
 from datetime import datetime, timedelta
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
 import requests
 import os
 import base64
@@ -10,11 +12,9 @@ import io
 from PIL import Image
 import uuid
 import json
+import secrets
 from typing import Optional
 from dotenv import load_dotenv
-from google.oauth2 import id_token
-from google.auth.transport import requests as google_requests
-import secrets
 
 load_dotenv()
 
@@ -40,7 +40,8 @@ habits_collection = db.habits
 # API Configuration
 AILAB_API_KEY = os.getenv("AILAB_API_KEY")
 AILAB_API_URL = "https://www.ailabapi.com/api/portrait/analysis/skin-analysis-advanced"
-GOOGLE_CLIENT_ID = os.getenv("299589499850-k8bihp6jic80pb1neeq6f0e2kt1o4l09.apps.googleusercontent.com")
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+
 # Helper function to verify session
 async def verify_session(session_token: str = Header(None)):
     if not session_token:
@@ -58,6 +59,9 @@ async def verify_session(session_token: str = Header(None)):
     return session["user_id"]
 
 @app.get("/api/health")
+async def health_check():
+    return {"status": "healthy", "timestamp": datetime.utcnow()}
+
 @app.post("/api/auth/google")
 async def google_auth(request: dict):
     """Handle Google OAuth authentication"""
@@ -136,21 +140,6 @@ async def google_auth(request: dict):
         
     except Exception as e:
         print(f"Auth error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-        }
-        sessions_collection.insert_one(session_doc)
-        
-        return {
-            "session_token": session_token,
-            "user": {
-                "user_id": user_id,
-                "email": user_data["email"],
-                "name": user_data["name"],
-                "picture": user_data.get("picture", "")
-            }
-        }
-    
-    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/user/profile")
